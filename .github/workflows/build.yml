@@ -92,7 +92,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bin/ffmpeg
-          key: ffmpeg-${{ env.FFMPEG_SOURCE_TAG }}-lgpl-${{ matrix.target }}
+          # The revision suffix is bumped whenever the build recipe below
+          # changes, so a stale binary is never restored over a fixed one.
+          key: ffmpeg-${{ env.FFMPEG_SOURCE_TAG }}-lgpl-r2-${{ matrix.target }}
 
       # BtbN publishes no macOS builds, and every widely used prebuilt static
       # macOS ffmpeg is configured with --enable-gpl. Compiling it here from
@@ -102,10 +104,17 @@ jobs:
         if: runner.os == 'macOS' && steps.mac-ffmpeg.outputs.cache-hit != 'true'
         run: |
           mkdir -p bin
-          curl -fsSL -o ffmpeg-src.tar.gz \
+          # Built outside the checkout: ffmpeg's version.sh walks up looking for
+          # a git repository, and inside ours it would stamp the binary with this
+          # project's commit instead of ffmpeg's version. The archive tarball
+          # carries no VERSION file either, so the pinned tag supplies it, and
+          # `ffmpeg -version` then names the release it was actually built from.
+          src="$RUNNER_TEMP/ffmpeg-src"
+          curl -fsSL -o "$RUNNER_TEMP/ffmpeg-src.tar.gz" \
             "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/$FFMPEG_SOURCE_TAG.tar.gz"
-          mkdir -p ffmpeg-src && tar -xzf ffmpeg-src.tar.gz -C ffmpeg-src --strip-components=1
-          cd ffmpeg-src
+          mkdir -p "$src" && tar -xzf "$RUNNER_TEMP/ffmpeg-src.tar.gz" -C "$src" --strip-components=1
+          echo "${FFMPEG_SOURCE_TAG#n}" > "$src/VERSION"
+          cd "$src"
           # LGPL is ffmpeg's default; the point is to not pass --enable-gpl.
           # --disable-autodetect is what keeps Homebrew's libraries out of the
           # build: x264 and friends sit on these runners and would otherwise be
@@ -121,9 +130,15 @@ jobs:
             --enable-static \
             --disable-shared
           make -j"$(sysctl -n hw.ncpu)"
-          cp ffmpeg ../bin/ffmpeg
-          cd ..
+          cd "$GITHUB_WORKSPACE"
+          cp "$src/ffmpeg" bin/ffmpeg
           chmod +x bin/ffmpeg
+          # Fail here rather than ship a binary whose provenance is unclear.
+          ./bin/ffmpeg -hide_banner -version | head -1
+          ./bin/ffmpeg -hide_banner -version | head -1 | grep -q "${FFMPEG_SOURCE_TAG#n}" || {
+            echo "built ffmpeg does not report version ${FFMPEG_SOURCE_TAG#n}" >&2
+            exit 1
+          }
 
       - name: Fetch 7zz (macOS)
         if: runner.os == 'macOS'
