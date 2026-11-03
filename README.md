@@ -1,7 +1,5 @@
 # g64-converter
 
-Created by [Elton Pinto](https://github.com/ielton).
-
 Converts Genetec Security Center / Omnicast **`.g64`** video exports to standard **MP4**
 files, without the Genetec Video Player and without re-encoding (original quality,
 fast). Runs on Windows 10/11 as a stand-alone program; the same script also runs on
