@@ -15,7 +15,10 @@ env:
   # Pinned so rebuilding an old tag fetches the same tools it shipped with.
   SEVENZIP_TAG: "26.05"
   SEVENZIP_VER: "2605"
-  MAC_FFMPEG_TAG: "b6.1.1"
+  # All three platforms stay on the 8.1 branch rather than a moving master
+  # snapshot, so the muxer behaves the same everywhere.
+  FFMPEG_BRANCH: "n8.1"
+  FFMPEG_SOURCE_TAG: "n8.1.3"
 
 jobs:
   test:
@@ -62,7 +65,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force bin | Out-Null
-          Invoke-WebRequest -Uri https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-lgpl.zip -OutFile ffmpeg.zip
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-$env:FFMPEG_BRANCH-latest-win64-lgpl-8.1.zip" -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-src
           Copy-Item (Get-ChildItem -Recurse -Filter ffmpeg.exe ffmpeg-src | Select-Object -First 1).FullName bin\ffmpeg.exe
           Invoke-WebRequest -Uri "https://github.com/ip7z/7zip/releases/download/$env:SEVENZIP_TAG/7z$env:SEVENZIP_VER-extra.7z" -OutFile 7z-extra.7z
@@ -73,7 +76,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir -p bin
-          curl -fsSL -o ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-lgpl.tar.xz
+          curl -fsSL -o ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-$FFMPEG_BRANCH-latest-linux64-lgpl-8.1.tar.xz"
           mkdir -p ffmpeg-src && tar -xJf ffmpeg.tar.xz -C ffmpeg-src --strip-components=1
           cp ffmpeg-src/bin/ffmpeg bin/ffmpeg
           curl -fsSL -o 7z.tar.xz "https://github.com/ip7z/7zip/releases/download/$SEVENZIP_TAG/7z$SEVENZIP_VER-linux-x64.tar.xz"
@@ -81,22 +84,55 @@ jobs:
           cp 7z-src/7zz bin/7zz
           chmod +x bin/ffmpeg bin/7zz
 
-      # BtbN publishes no macOS builds, so ffmpeg comes from ffmpeg-static,
-      # which ships a self-contained binary for both Mac architectures.
-      - name: Fetch ffmpeg and 7zz (macOS)
+      # Compiling ffmpeg is slow, and its result only changes when the pinned
+      # tag does, so it is cached across runs.
+      - name: Cache the macOS ffmpeg build
+        if: runner.os == 'macOS'
+        id: mac-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: bin/ffmpeg
+          key: ffmpeg-${{ env.FFMPEG_SOURCE_TAG }}-lgpl-${{ matrix.target }}
+
+      # BtbN publishes no macOS builds, and every widely used prebuilt static
+      # macOS ffmpeg is configured with --enable-gpl. Compiling it here from
+      # the upstream tarball is the only way to ship a provably LGPL binary
+      # without trusting a third party's build.
+      - name: Build ffmpeg from source, LGPL (macOS)
+        if: runner.os == 'macOS' && steps.mac-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p bin
+          curl -fsSL -o ffmpeg-src.tar.gz \
+            "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/$FFMPEG_SOURCE_TAG.tar.gz"
+          mkdir -p ffmpeg-src && tar -xzf ffmpeg-src.tar.gz -C ffmpeg-src --strip-components=1
+          cd ffmpeg-src
+          # LGPL is ffmpeg's default; the point is to not pass --enable-gpl.
+          # --disable-autodetect is what keeps Homebrew's libraries out of the
+          # build: x264 and friends sit on these runners and would otherwise be
+          # picked up silently, turning the result GPL again. The converter only
+          # remuxes, so it needs no external codec library at all.
+          ./configure \
+            --disable-autodetect \
+            --disable-doc \
+            --disable-ffplay \
+            --disable-ffprobe \
+            --disable-network \
+            --disable-debug \
+            --enable-static \
+            --disable-shared
+          make -j"$(sysctl -n hw.ncpu)"
+          cp ffmpeg ../bin/ffmpeg
+          cd ..
+          chmod +x bin/ffmpeg
+
+      - name: Fetch 7zz (macOS)
         if: runner.os == 'macOS'
         run: |
           mkdir -p bin
-          case "$(uname -m)" in
-            arm64)  ff_arch=darwin-arm64 ;;
-            x86_64) ff_arch=darwin-x64 ;;
-            *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-          curl -fsSL -o bin/ffmpeg "https://github.com/eugeneware/ffmpeg-static/releases/download/$MAC_FFMPEG_TAG/ffmpeg-$ff_arch"
           curl -fsSL -o 7z.tar.xz "https://github.com/ip7z/7zip/releases/download/$SEVENZIP_TAG/7z$SEVENZIP_VER-mac.tar.xz"
           mkdir -p 7z-src && tar -xJf 7z.tar.xz -C 7z-src
           cp 7z-src/7zz bin/7zz
-          chmod +x bin/ffmpeg bin/7zz
+          chmod +x bin/7zz
 
       - name: Build
         run: pyinstaller --noconfirm g64-converter.spec

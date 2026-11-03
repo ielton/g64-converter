@@ -14,14 +14,19 @@ Used to mux the reassembled elementary stream into MP4 with `-c copy`.
 | Project | <https://ffmpeg.org> |
 | Source code | <https://github.com/FFmpeg/FFmpeg> |
 | License | GNU Lesser General Public License v2.1 or later |
-| Windows / Linux builds | <https://github.com/BtbN/FFmpeg-Builds> (`*-lgpl` variants) |
-| macOS builds | <https://github.com/eugeneware/ffmpeg-static> |
+| Windows / Linux builds | <https://github.com/BtbN/FFmpeg-Builds> (`n8.1-latest-*-lgpl`) |
+| macOS build | compiled from the upstream tag in CI |
 
 The converter never encodes video, only remuxes it, so it has no use for the
 GPL-licensed parts of FFmpeg (x264, x265, libpostproc and the GPL filters).
 The packages therefore bundle an **LGPL** build, configured without
 `--enable-gpl`. Every release build asserts this by checking the configure
 line printed by `ffmpeg -version`; the build fails if a GPL build is picked up.
+
+No trustworthy prebuilt static macOS ffmpeg is configured that way — the
+widely used ones all enable the GPL parts — so the macOS package's ffmpeg is
+compiled from the upstream release tarball during the build instead, with
+`--disable-autodetect` so that no external codec library is linked in.
 
 Run `ffmpeg -version` on the bundled binary to see the exact version and
 configure flags of the build you received. The corresponding source for any
