@@ -40,7 +40,7 @@ jobs:
       - name: Download 7-Zip console (7za.exe)
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri https://www.7-zip.org/a/7z2409-extra.7z -OutFile 7z-extra.7z
+          Invoke-WebRequest -Uri https://github.com/ip7z/7zip/releases/download/25.01/7z2501-extra.7z -OutFile 7z-extra.7z
           7z x 7z-extra.7z -o7z-extra | Out-Null
           Copy-Item 7z-extra\x64\7za.exe bin\7za.exe
 
