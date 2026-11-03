@@ -1,0 +1,74 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+
+  build-windows:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+
+      - name: Download ffmpeg (static build)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bin | Out-Null
+          Invoke-WebRequest -Uri https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-src
+          $exe = Get-ChildItem -Recurse -Filter ffmpeg.exe ffmpeg-src | Select-Object -First 1
+          Copy-Item $exe.FullName bin\ffmpeg.exe
+
+      - name: Download 7-Zip console (7za.exe)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://www.7-zip.org/a/7z2409-extra.7z -OutFile 7z-extra.7z
+          7z x 7z-extra.7z -o7z-extra | Out-Null
+          Copy-Item 7z-extra\x64\7za.exe bin\7za.exe
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --onedir --name g64-converter --hidden-import g64_gui g64_to_mp4.py
+          Copy-Item bin\ffmpeg.exe dist\g64-converter\
+          Copy-Item bin\7za.exe dist\g64-converter\
+          Copy-Item README.md dist\g64-converter\
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          dist\g64-converter\g64-converter.exe --version
+          dist\g64-converter\g64-converter.exe --help
+
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path dist\g64-converter -DestinationPath g64-converter-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g64-converter-windows
+          path: g64-converter-windows.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: g64-converter-windows.zip

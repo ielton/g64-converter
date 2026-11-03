@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+bin/
+*.spec
+*.mp4
+*.g64
+*.g64x
+*.zip
+.DS_Store
