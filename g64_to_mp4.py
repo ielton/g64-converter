@@ -27,13 +27,14 @@ last GOP is prepended when the recording is contiguous; no frame is lost.
 import argparse
 import datetime
 import os
+import queue
 import re
 import shutil
 import statistics
 import struct
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 import zipfile
 
@@ -53,6 +54,16 @@ GOP_GAP_SECONDS = 2.0  # max gap between files to treat the recording as contigu
 def log(message):
     """Default logger: print to stdout. The GUI replaces this attribute."""
     print(message, flush=True)
+
+
+def read_file(path):
+    """Read a whole file, closing the handle before returning.
+
+    An export can hold hundreds of files, so leaving each handle for the
+    garbage collector to notice is not worth the shorter expression.
+    """
+    with open(path, "rb") as f:
+        return f.read()
 
 
 # --- external tools ------------------------------------------------------------
@@ -297,7 +308,7 @@ def parse_g64_bytes(data):
 
 def diagnose(path):
     """Human-readable description of a .g64 file."""
-    data = open(path, "rb").read()
+    data = read_file(path)
     res = parse_g64_bytes(data)
     lines = [
         "file: %s" % path,
@@ -319,14 +330,18 @@ def diagnose(path):
 
 # --- MP4 muxing -------------------------------------------------------------------
 
-def write_mp4(frames, dst, tmpdir, codec):
+def write_mp4(frames, dst, codec):
+    """Mux the frames into dst, feeding the elementary stream to ffmpeg's stdin.
+
+    Staging the stream in a temporary file and letting ffmpeg read it back cost
+    a full write plus a full read of the whole payload. Piping hands it over a
+    frame at a time instead, so nothing but the frames already in memory is
+    held. `+faststart` seeks the output, never the input, so a piped input is
+    fine for it.
+    """
     ffmpeg = ffmpeg_path()
     if not ffmpeg:
         raise RuntimeError("ffmpeg not found (put ffmpeg next to the program or on PATH)")
-    raw = os.path.join(tmpdir, "stream." + codec)
-    with open(raw, "wb") as f:
-        for _, nal_bytes, _ in frames:
-            f.write(nal_bytes)
     fts = [fr[0] for fr in frames]
     deltas = [(b - a) / 1e7 for a, b in zip(fts, fts[1:]) if b > a]
     median = statistics.median(deltas) if deltas else 1 / 15
@@ -334,18 +349,103 @@ def write_mp4(frames, dst, tmpdir, codec):
     fps = len(frames) / duration if duration > 0 else 15.0
     created = ft_to_dt(fts[0]).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     cmd = [ffmpeg, "-y", "-v", "error", "-fflags", "+genpts", "-r", "%.6f" % fps,
-           "-f", codec, "-i", raw, "-c", "copy", "-movflags", "+faststart",
+           "-f", codec, "-i", "pipe:0", "-c", "copy", "-movflags", "+faststart",
            "-metadata", "creation_time=" + created]
     if codec == "hevc":
         cmd += ["-tag:v", "hvc1"]  # Apple players need the hvc1 tag
     cmd.append(dst)
-    r = subprocess.run(cmd, capture_output=True, text=True, **_popen_flags())
-    os.remove(raw)
-    err = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else ""
-    return fps, r.returncode, err
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, **_popen_flags())
+
+    def feed():
+        try:
+            for _, nal_bytes, _ in frames:
+                proc.stdin.write(nal_bytes)
+        except (BrokenPipeError, OSError):
+            pass  # ffmpeg stopped reading; its stderr carries the reason
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    # stderr is drained here while the frames go in on another thread. Doing
+    # both from one thread deadlocks as soon as either pipe buffer fills.
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    stderr = proc.stderr.read()
+    proc.stderr.close()
+    rc = proc.wait()
+    writer.join()
+    text = stderr.decode("utf-8", "replace").strip()
+    err = text.splitlines()[-1] if text else ""
+    return fps, rc, err
 
 
 # --- conversion -------------------------------------------------------------------
+
+def _prefetch(sources, depth=1):
+    """Yield (cam, name, payload, read_seconds), reading ahead on one thread.
+
+    Reading and parsing used to alternate, so the media sat idle during every
+    parse and the CPU sat idle during every read. One reader thread running a
+    file ahead overlaps the two.
+
+    Deliberately a single reader, always in source order: concurrent readers
+    would turn one sequential stream into several competing ones, which helps a
+    fast SSD but hurts a spinning or external disk. Since the destination media
+    is unknown, this takes the shape that is never worse than reading serially.
+
+    A failing loader yields the exception as its payload, so one unreadable
+    file does not take the reader down with it.
+    """
+    pending = queue.Queue(maxsize=max(1, depth))
+    stop = threading.Event()
+    done = object()
+
+    def reader():
+        try:
+            for cam, name, loader in sources:
+                if stop.is_set():
+                    return
+                started = time.time()
+                try:
+                    payload = loader()
+                except Exception as e:  # surfaced on the consuming side
+                    payload = e
+                elapsed = time.time() - started
+                # Poll rather than block forever: the consumer may stop early
+                # (--limit), and the reader must not keep a file alive in memory
+                # waiting for a hand-off that will never come.
+                while not stop.is_set():
+                    try:
+                        pending.put((cam, name, payload, elapsed), timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            # Retried for the same reason the payloads are, and it matters more:
+            # the consumer blocks on get() until this arrives, so dropping it
+            # because the last file had not been picked up yet would hang the
+            # conversion at the very end.
+            while not stop.is_set():
+                try:
+                    pending.put(done, timeout=0.2)
+                    break
+                except queue.Full:
+                    continue
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = pending.get()
+            if item is done:
+                return
+            yield item
+    finally:
+        stop.set()
+
 
 class CamState:
     """Carry-over between consecutive files of one camera (its last GOP)."""
@@ -370,13 +470,16 @@ def output_name(name):
     return base + ".mp4"
 
 
-def convert_one(cam, name, load_bytes, out_root, state, tmpdir, summary):
+def convert_one(cam, name, data, read_s, out_root, state, summary):
+    """Convert one already-read file. read_s is how long fetching it took."""
     t0 = time.time()
     label = ("[%s] " % cam) if cam else ""
     out_dir = os.path.join(out_root, cam) if cam else out_root
     os.makedirs(out_dir, exist_ok=True)
     dst = os.path.join(out_dir, output_name(name))
-    res = parse_g64_bytes(load_bytes())
+    parse_started = time.time()
+    res = parse_g64_bytes(data)
+    parse_s = time.time() - parse_started
     if res.unsupported:
         log("%s%s: UNSUPPORTED - %s" % (label, name, res.unsupported))
         summary.unsupported.append((name, res.unsupported))
@@ -405,7 +508,9 @@ def convert_one(cam, name, load_bytes, out_root, state, tmpdir, summary):
         log("%s%s: exists, skipped" % (label, os.path.basename(dst)))
         summary.skipped += 1
         return False
-    fps, rc, err = write_mp4(frames, dst, tmpdir, res.codec)
+    mux_started = time.time()
+    fps, rc, err = write_mp4(frames, dst, res.codec)
+    mux_s = time.time() - mux_started
     if rc != 0:
         log("%s%s: FFMPEG FAILED (%s)" % (label, os.path.basename(dst), err))
         summary.failed += 1
@@ -413,9 +518,13 @@ def convert_one(cam, name, load_bytes, out_root, state, tmpdir, summary):
     size_mb = os.path.getsize(dst) / 1e6
     t_first = ft_to_dt(frames[0][0]).strftime("%H:%M:%S")
     t_last = ft_to_dt(frames[-1][0]).strftime("%H:%M:%S")
-    log("%s%s: OK %s %d frames %.1f fps utc %s-%s %.0f MB%s (%.0fs)" % (
-        label, os.path.basename(dst), res.codec, len(frames), fps, t_first, t_last,
-        size_mb, (" " + note) if note else "", time.time() - t0))
+    # The read/parse/mux split is what says whether the media or the CPU is the
+    # limit on a given machine, which is not something the code can assume.
+    log("%s%s: OK %s %d frames %.1f fps utc %s-%s %.0f MB%s "
+        "(%.1fs: read %.1f parse %.1f mux %.1f)" % (
+            label, os.path.basename(dst), res.codec, len(frames), fps, t_first,
+            t_last, size_mb, (" " + note) if note else "",
+            read_s + (time.time() - t0), read_s, parse_s, mux_s))
     summary.converted += 1
     return True
 
@@ -436,7 +545,7 @@ def sources_from_dir(root):
         for fn in sorted(filenames):
             if _is_g64(fn):
                 full = os.path.join(dirpath, fn)
-                items.append((cam, fn, lambda p=full: open(p, "rb").read()))
+                items.append((cam, fn, lambda p=full: read_file(p)))
     return items
 
 
@@ -475,7 +584,7 @@ def collect_sources(path):
     if path.lower().endswith(".zip"):
         return sources_from_zip(path)
     if _is_g64(path):
-        return [("", os.path.basename(path), lambda p=path: open(p, "rb").read())]
+        return [("", os.path.basename(path), lambda p=path: read_file(p))]
     raise RuntimeError("not a .g64 file, folder or .zip: %s" % path)
 
 
@@ -492,30 +601,31 @@ def run(inputs, out_root=None, limit=None):
         log("ERROR: ffmpeg not found. Put ffmpeg(.exe) next to this program or on PATH.")
         summary.failed += 1
         return summary
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for inp in inputs:
-            out = out_root or default_output(inp)
-            log("input: %s" % inp)
-            log("output: %s" % out)
+    for inp in inputs:
+        out = out_root or default_output(inp)
+        log("input: %s" % inp)
+        log("output: %s" % out)
+        try:
+            sources = collect_sources(inp)
+        except RuntimeError as e:
+            log("ERROR: %s" % e)
+            summary.failed += 1
+            continue
+        if not sources:
+            log("no .g64 files found in %s" % inp)
+            continue
+        states = {}
+        for cam, name, payload, read_s in _prefetch(sources):
+            if limit and summary.converted >= limit:
+                break
+            state = states.setdefault(cam, CamState())
             try:
-                sources = collect_sources(inp)
-            except RuntimeError as e:
-                log("ERROR: %s" % e)
+                if isinstance(payload, Exception):
+                    raise payload
+                convert_one(cam, name, payload, read_s, out, state, summary)
+            except Exception as e:  # keep going with the next file
+                log("%s: ERROR %s" % (name, e))
                 summary.failed += 1
-                continue
-            if not sources:
-                log("no .g64 files found in %s" % inp)
-                continue
-            states = {}
-            for cam, name, loader in sources:
-                if limit and summary.converted >= limit:
-                    break
-                state = states.setdefault(cam, CamState())
-                try:
-                    convert_one(cam, name, loader, out, state, tmpdir, summary)
-                except Exception as e:  # keep going with the next file
-                    log("%s: ERROR %s" % (name, e))
-                    summary.failed += 1
     log("done: %d converted, %d skipped, %d failed" % (summary.converted, summary.skipped, summary.failed))
     return summary
 
