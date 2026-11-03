@@ -8,9 +8,14 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, scrolledtext, ttk
 
 import g64_to_mp4 as core
+
+AUTHOR = "Elton Pinto"
+AUTHOR_GITHUB = "https://github.com/ielton"
+PROJECT_URL = "https://github.com/ielton/g64-converter"
 
 
 class App(tk.Tk):
@@ -49,6 +54,7 @@ class App(tk.Tk):
         self.convert_btn = ttk.Button(actions, text="Convert", command=self._start)
         self.convert_btn.pack(side="left")
         ttk.Button(actions, text="Open output folder", command=self._open_output).pack(side="left", padx=8)
+        ttk.Button(actions, text="About", command=self._about).pack(side="left")
 
         self.log = scrolledtext.ScrolledText(frame, height=16, state="disabled", wrap="word")
         self.log.grid(row=3, column=0, columnspan=3, sticky="nsew", **pad)
@@ -90,6 +96,28 @@ class App(tk.Tk):
             subprocess.Popen(["open", path])
         else:
             subprocess.Popen(["xdg-open", path])
+
+    # --- about ---
+    def _about(self):
+        win = tk.Toplevel(self)
+        win.title("About")
+        win.resizable(False, False)
+        win.transient(self)
+        box = ttk.Frame(win, padding=16)
+        box.pack(fill="both", expand=True)
+        ttk.Label(box, text="G64 to MP4 converter %s" % core.__version__,
+                  font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
+        ttk.Label(box, text="Converts Genetec G64 video exports to MP4 without re-encoding.").pack(anchor="w", pady=(2, 10))
+        ttk.Label(box, text="Created by %s" % AUTHOR).pack(anchor="w")
+        self._link(box, "GitHub profile: " + AUTHOR_GITHUB, AUTHOR_GITHUB)
+        self._link(box, "Project: " + PROJECT_URL, PROJECT_URL)
+        ttk.Button(box, text="Close", command=win.destroy).pack(anchor="e", pady=(12, 0))
+        win.grab_set()
+
+    def _link(self, parent, text, url):
+        label = tk.Label(parent, text=text, fg="#1a5fb4", cursor="hand2")
+        label.pack(anchor="w")
+        label.bind("<Button-1>", lambda _e, u=url: webbrowser.open(u))
 
     # --- conversion ---
     def _start(self):

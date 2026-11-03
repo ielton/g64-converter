@@ -37,7 +37,7 @@ import tempfile
 import time
 import zipfile
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 EPOCH_DIFF = 116444736000000000  # FILETIME ticks between 1601-01-01 and 1970-01-01
 MAGIC = b"Genetec Omnicast Archive"
