@@ -57,7 +57,12 @@ python3 -m unittest discover -s tests
 The GitHub Actions workflow in `.github/workflows/build-windows.yml` builds it on a
 Windows runner: run tests, download static `ffmpeg.exe` (BtbN builds) and `7za.exe`
 (7-Zip extra package), run PyInstaller, zip the folder. It runs on every tag `v*`
-(and attaches the zip to the release) or manually from the Actions tab.
+or manually from the Actions tab. To publish a version, create the release first so
+it is authored by you, then the workflow attaches the package to it:
+
+```
+gh release create v1.2.0 --title "v1.2.0" --notes "What changed"
+```
 
 To build locally on Windows:
 
