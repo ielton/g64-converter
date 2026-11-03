@@ -3,7 +3,9 @@ __pycache__/
 build/
 dist/
 bin/
+# PyInstaller writes throwaway specs next to the project; ours is checked in.
 *.spec
+!g64-converter.spec
 *.mp4
 *.g64
 *.g64x

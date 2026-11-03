@@ -1,0 +1,196 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to attach the packages to a release
+
+env:
+  PYTHON_VERSION: "3.12"
+  # Pinned so rebuilding an old tag fetches the same tools it shipped with.
+  SEVENZIP_TAG: "26.05"
+  SEVENZIP_VER: "2605"
+  MAC_FFMPEG_TAG: "b6.1.1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: python -m unittest discover -s tests -v
+
+  build:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x64
+          # macos-14 was retired on 2026-11-02; macos-15 is the arm64 image.
+          # For Intel Macs add: {os: macos-15-intel, target: macos-x64}
+          - os: macos-15
+            target: macos-arm64
+          # Oldest available image, so the binary links against the oldest
+          # glibc and runs on the widest range of distributions.
+          - os: ubuntu-22.04
+            target: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -r requirements-dev.txt
+
+      # The GUI is tkinter; if the interpreter was built without it the window
+      # would fail only at run time, in the user's hands.
+      - name: Verify tkinter is available
+        run: python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
+
+      - name: Fetch ffmpeg and 7za (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bin | Out-Null
+          Invoke-WebRequest -Uri https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-lgpl.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-src
+          Copy-Item (Get-ChildItem -Recurse -Filter ffmpeg.exe ffmpeg-src | Select-Object -First 1).FullName bin\ffmpeg.exe
+          Invoke-WebRequest -Uri "https://github.com/ip7z/7zip/releases/download/$env:SEVENZIP_TAG/7z$env:SEVENZIP_VER-extra.7z" -OutFile 7z-extra.7z
+          7z x 7z-extra.7z -o7z-extra | Out-Null
+          Copy-Item 7z-extra\x64\7za.exe bin\7za.exe
+
+      - name: Fetch ffmpeg and 7zz (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p bin
+          curl -fsSL -o ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-lgpl.tar.xz
+          mkdir -p ffmpeg-src && tar -xJf ffmpeg.tar.xz -C ffmpeg-src --strip-components=1
+          cp ffmpeg-src/bin/ffmpeg bin/ffmpeg
+          curl -fsSL -o 7z.tar.xz "https://github.com/ip7z/7zip/releases/download/$SEVENZIP_TAG/7z$SEVENZIP_VER-linux-x64.tar.xz"
+          mkdir -p 7z-src && tar -xJf 7z.tar.xz -C 7z-src
+          cp 7z-src/7zz bin/7zz
+          chmod +x bin/ffmpeg bin/7zz
+
+      # BtbN publishes no macOS builds, so ffmpeg comes from ffmpeg-static,
+      # which ships a self-contained binary for both Mac architectures.
+      - name: Fetch ffmpeg and 7zz (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p bin
+          case "$(uname -m)" in
+            arm64)  ff_arch=darwin-arm64 ;;
+            x86_64) ff_arch=darwin-x64 ;;
+            *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl -fsSL -o bin/ffmpeg "https://github.com/eugeneware/ffmpeg-static/releases/download/$MAC_FFMPEG_TAG/ffmpeg-$ff_arch"
+          curl -fsSL -o 7z.tar.xz "https://github.com/ip7z/7zip/releases/download/$SEVENZIP_TAG/7z$SEVENZIP_VER-mac.tar.xz"
+          mkdir -p 7z-src && tar -xJf 7z.tar.xz -C 7z-src
+          cp 7z-src/7zz bin/7zz
+          chmod +x bin/ffmpeg bin/7zz
+
+      - name: Build
+        run: pyinstaller --noconfirm g64-converter.spec
+
+      # find_tool() looks next to the executable, which inside a .app bundle
+      # means Contents/MacOS, not the folder holding the bundle.
+      - name: Stage bundled tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item bin\ffmpeg.exe, bin\7za.exe, README.md dist\g64-converter\
+
+      - name: Stage bundled tools (Linux)
+        if: runner.os == 'Linux'
+        run: cp bin/ffmpeg bin/7zz README.md dist/g64-converter/
+
+      - name: Stage bundled tools (macOS)
+        if: runner.os == 'macOS'
+        run: cp bin/ffmpeg bin/7zz dist/g64-converter.app/Contents/MacOS/
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dist\g64-converter\g64-converter.exe --version
+          dist\g64-converter\g64-converter.exe --help
+          if (-not (Test-Path dist\g64-converter\g64-converter-gui.exe)) { throw "windowed executable missing" }
+          # The converter only ever remuxes with -c copy, so it has no use for
+          # the GPL-only parts of ffmpeg. Shipping an LGPL build keeps the
+          # redistribution duties minimal, and only the configure line proves
+          # which build this actually is.
+          $cfg = dist\g64-converter\ffmpeg.exe -hide_banner -version | Out-String
+          if ($cfg -match "--enable-gpl") { throw "bundled ffmpeg is a GPL build; LGPL expected" }
+          ($cfg -split "`n")[0]
+
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dist/g64-converter/g64-converter --version
+          dist/g64-converter/g64-converter --help
+          # See the Windows smoke test for why a GPL build is rejected.
+          dist/g64-converter/ffmpeg -hide_banner -version | head -1
+          if dist/g64-converter/ffmpeg -hide_banner -version | grep -q -- --enable-gpl; then
+            echo "bundled ffmpeg is a GPL build; LGPL expected" >&2
+            exit 1
+          fi
+
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          macos=dist/g64-converter.app/Contents/MacOS
+          "$macos/g64-converter" --version
+          "$macos/g64-converter" --help
+          test -x "$macos/g64-converter-gui" || { echo "windowed executable missing" >&2; exit 1; }
+          # See the Windows smoke test for why a GPL build is rejected. The
+          # LICENSE file ffmpeg-static ships is ffmpeg's generic text and does
+          # not reveal the configure flags, so this check is the only proof.
+          "$macos/ffmpeg" -hide_banner -version | head -1
+          if "$macos/ffmpeg" -hide_banner -version | grep -q -- --enable-gpl; then
+            echo "bundled ffmpeg is a GPL build; LGPL expected" >&2
+            exit 1
+          fi
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist\g64-converter -DestinationPath g64-converter-${{ matrix.target }}.zip
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: tar -czf g64-converter-${{ matrix.target }}.tar.gz -C dist g64-converter
+
+      # ditto preserves the bundle's permissions and symlinks; zip -r does not.
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent dist/g64-converter.app g64-converter-${{ matrix.target }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g64-converter-${{ matrix.target }}
+          path: g64-converter-${{ matrix.target }}.*
+          if-no-files-found: error
+
+      # Releases are created by the repository owner (gh release create vX.Y.Z ...);
+      # this step only attaches packages to an existing release, so the release
+      # author is always the owner, never the Actions bot.
+      - name: Attach package to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" g64-converter-${{ matrix.target }}.* --clobber
+          else
+            echo "No release named $tag yet; package kept as workflow artifact only."
+          fi

@@ -20,58 +20,107 @@ macOS and Linux with Python 3.
 Run `g64-converter --diag FILE.g64` on anything that fails: it prints the container
 version, stream ids, RTP payload types and codec, which is what is needed to add support.
 
-## Using the Windows build
+## Download and run
 
-1. Download `g64-converter-windows.zip` from the Releases page and unzip it anywhere.
-   The folder holds `g64-converter.exe`, `ffmpeg.exe` and `7za.exe`; keep them together.
-2. Either **drag** a `.zip` export, a folder of `.g64` files, or a single `.g64` file
-   onto `g64-converter.exe`, or **double-click** it to get a small window with
-   Source / Output / Convert.
-3. MP4 files appear in a folder named `MP4` next to the input, one sub-folder per
-   camera, same file names as the originals.
+Nothing to install: each package is self-contained and carries its own `ffmpeg`
+and `7z`. Pick your platform on the
+[Releases](https://github.com/ielton/g64-converter/releases) page.
 
-Windows SmartScreen shows "unknown publisher" the first time because the build is
-not code-signed. Click *More info* → *Run anyway*.
+| Platform | Package |
+|---|---|
+| Windows 10/11 (x64) | `g64-converter-windows-x64.zip` |
+| macOS (Apple Silicon) | `g64-converter-macos-arm64.zip` |
+| Linux (x64, glibc 2.35+) | `g64-converter-linux-x64.tar.gz` |
+
+Intel Macs and other architectures are not packaged; run from source there.
+
+Either point the window at a `.zip` export, a folder of `.g64` files or a single
+`.g64` file, or pass it on the command line. MP4 files appear in a folder named
+`MP4` next to the input, one sub-folder per camera, with the same file names as
+the originals.
+
+### Windows
+
+Unzip anywhere and keep the folder's contents together. It holds two
+executables, because one program cannot both open a window with no console
+attached and still print to the command line:
+
+- **`g64-converter-gui.exe`** — double-click this one; no terminal window appears.
+- `g64-converter.exe` — the command line build. Files can also be dragged onto it.
+
+SmartScreen shows "unknown publisher" the first time because the build is not
+code-signed. Click *More info* → *Run anyway*.
+
+### macOS
+
+Unzip and move `g64-converter.app` wherever you like. The app is not signed or
+notarized, so Gatekeeper blocks a plain double-click the first time: **right-click
+the app → Open**, then confirm. macOS remembers the choice afterwards.
+
+The command line build sits inside the bundle:
+
+```
+g64-converter.app/Contents/MacOS/g64-converter CAM01.zip
+```
+
+### Linux
+
+```
+tar -xzf g64-converter-linux-x64.tar.gz
+./g64-converter/g64-converter CAM01.zip   # no arguments opens the window
+```
 
 ### Command line
 
+The same arguments work on every platform:
+
 ```
-g64-converter.exe CAM01.zip                 # MP4 next to the zip
-g64-converter.exe D:\export\CAM01 -o E:\MP4 # folder in, custom output
-g64-converter.exe --diag some_file.g64      # describe the file
+g64-converter CAM01.zip                 # MP4 next to the zip
+g64-converter D:\export\CAM01 -o E:\MP4 # folder in, custom output
+g64-converter --diag some_file.g64      # describe the file
 ```
 
-## Running from source (macOS / Linux / Windows with Python)
+## Running from source
 
-Requires Python 3.9+ and `ffmpeg` on PATH (`brew install ffmpeg`, `apt install ffmpeg`).
-`7z` (p7zip / 7-Zip) is only needed for cut-off zip downloads.
+Requires Python 3.9+ with tkinter, plus `ffmpeg` either on PATH
+(`brew install ffmpeg`, `apt install ffmpeg`) or placed next to
+`g64_to_mp4.py`. `7z` (p7zip / 7-Zip) is only needed for cut-off zip downloads.
+`G64_FFMPEG` and `G64_7Z` override the lookup with an explicit path.
 
 ```
 python3 g64_to_mp4.py CAM01.zip
 python3 g64_to_mp4.py /path/to/folder -o /path/to/MP4
+python3 g64_to_mp4.py                   # no arguments opens the window
 python3 -m unittest discover -s tests
 ```
 
-## Building the Windows package
+## Building the packages
 
-The GitHub Actions workflow in `.github/workflows/build-windows.yml` builds it on a
-Windows runner: run tests, download static `ffmpeg.exe` (BtbN builds) and `7za.exe`
-(7-Zip extra package), run PyInstaller, zip the folder. It runs on every tag `v*`
-or manually from the Actions tab. To publish a version, create the release first so
-it is authored by you, then the workflow attaches the package to it:
+`.github/workflows/build.yml` builds all three platforms, on every tag `v*` or
+manually from the Actions tab: it runs the tests, downloads a static **LGPL**
+ffmpeg and the 7-Zip console tool for the target platform, runs PyInstaller
+against `g64-converter.spec` and packages the result. The converter only ever
+remuxes with `-c copy`, so it never needs the GPL-only parts of ffmpeg; the
+build asserts the bundled binary was configured without `--enable-gpl`. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+To publish a version, create the release first so it is authored by you, then
+the workflow attaches each platform's package to it:
 
 ```
 gh release create v1.2.0 --title "v1.2.0" --notes "What changed"
 ```
 
-To build locally on Windows:
+To build locally for the platform you are on:
 
 ```
-pip install pyinstaller
-pyinstaller --noconfirm --onedir --name g64-converter --hidden-import g64_gui g64_to_mp4.py
-copy ffmpeg.exe dist\g64-converter\
-copy 7za.exe dist\g64-converter\
+pip install -r requirements-dev.txt
+pyinstaller --noconfirm g64-converter.spec
 ```
+
+The spec builds one console executable and, on Windows and macOS, a second
+windowed one with no console attached. `ffmpeg` and `7z` then have to be copied
+next to the executables — inside `Contents/MacOS` for the macOS bundle.
 
 ## How it works
 
